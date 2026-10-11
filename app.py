@@ -129,6 +129,15 @@ if uploaded_file is not None:
 if pasted_logs.strip():
     st.session_state.raw_logs = pasted_logs
 
+with st.expander("⚙️ Detection rule settings", expanded=False):
+    setting_col1, setting_col2 = st.columns(2)
+    with setting_col1:
+        failed_login_threshold = st.slider("Failed logins to trigger alert", min_value=3, max_value=20, value=5, step=1)
+    with setting_col2:
+        time_window_minutes = st.slider("Authentication time window (minutes)", min_value=1, max_value=60, value=5, step=1)
+    sequence_threshold = st.slider("Failures before a successful login alert", min_value=2, max_value=10, value=3, step=1)
+    st.caption("Time-window rules require parseable timestamps. Events without timestamps are not counted toward brute-force windows.")
+
 analyze_clicked = st.button("🔍 Analyze Logs", type="primary", use_container_width=True)
 
 if analyze_clicked:
@@ -139,7 +148,7 @@ if analyze_clicked:
         with st.spinner("Parsing logs and running detection rules..."):
             try:
                 events = load_logs(raw)
-                result = analyze_logs(events)
+                result = analyze_logs(events, failed_login_threshold=failed_login_threshold, time_window_minutes=time_window_minutes, sequence_threshold=sequence_threshold)
                 st.session_state.analysis = result
                 st.session_state.ai_summary = None
                 st.session_state.events = events
