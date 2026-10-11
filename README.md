@@ -72,3 +72,28 @@ timestamp,host,source_ip,username,event_type,status,message
 - AI output is advisory. Validate all findings against original telemetry and your organization's incident response process.
 - Use fictional or sanitized logs. Do not upload passwords, tokens, personal data, or confidential production logs.
 - The app does not perform live IP reputation checks, network scanning, or endpoint actions.
+
+## Updated detection features
+
+- Time-window brute-force detection: counts the peak number of timestamped failed logins from a source IP within a configurable number of minutes.
+- Windows Security event ID support: structured `event_id` / `eventid` fields recognize 4625 (failed logon) and 4624 (successful logon).
+- SSH authentication parsing: common `sshd` failed-password and accepted-password messages are normalized.
+- Configurable dashboard settings: failed-login threshold, time window, and failures-before-success threshold.
+- Automated unit tests cover expected detections and a benign event that should not trigger an alert.
+
+Run the tests locally with:
+
+```bash
+python -m unittest -v
+```
+
+### Example Windows CSV fields
+
+For Windows Event Viewer exports, a CSV containing fields such as `TimeCreated`, `Computer`, `IpAddress`, `TargetUserName`, `EventID`, and `Message` can be adapted to the analyzer's canonical fields. The analyzer recognizes common timestamp, host, source-IP, username, and event-ID aliases; verify the column mapping against your actual export before relying on results.
+
+### Detection limitations
+
+- Time-window correlation requires parseable timestamps. Events without timestamps are excluded from brute-force window counting.
+- Windows Event IDs are only as reliable as the fields provided in the CSV export. Native EVTX/XML exports may need conversion to CSV first.
+- Keyword detections are starter rules, not proof of compromise. Tune and validate them against your environment.
+- Community Sigma/Elastic/Splunk rules are not automatically executable by this project. Review rule logic, required telemetry, field mappings, and license terms before adapting any rule.
