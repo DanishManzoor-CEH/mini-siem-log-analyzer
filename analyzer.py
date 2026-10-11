@@ -1,6 +1,7 @@
 import csv
 import io
 import re
+from datetime import datetime
 from collections import Counter, defaultdict
 
 
@@ -9,7 +10,8 @@ COLUMN_ALIASES = {
     "host": ["host", "hostname", "computer", "computername", "device", "server"],
     "source_ip": ["source_ip", "src_ip", "src", "ip", "client_ip", "remote_ip", "ip_address"],
     "username": ["username", "user", "account", "account_name", "user_name"],
-    "event_type": ["event_type", "event", "eventid", "event_id", "category", "action"],
+    "event_type": ["event_type", "event", "category", "action"],
+    "event_id": ["event_id", "eventid", "windows_event_id", "win_event_id"],
     "status": ["status", "result", "outcome", "login_status", "authentication_result"],
     "message": ["message", "details", "description", "log", "raw", "event_message"],
 }
@@ -45,6 +47,14 @@ def _canonicalize_row(row):
         result["event_type"] = _infer_event_type(" ".join([msg, *normalized.values()]))
     if not result.get("status"):
         result["status"] = _infer_status(" ".join([msg, *normalized.values()]))
+    # Windows Security auditing event IDs have explicit authentication meaning.
+    event_id = result.get("event_id", "").strip()
+    if event_id == "4625":
+        result["status"] = "failed"
+        result["event_type"] = "login"
+    elif event_id == "4624":
+        result["status"] = "success"
+        result["event_type"] = "login"
     return result
 
 def _infer_status(text):
@@ -130,8 +140,33 @@ def load_logs(raw_text):
 
     return events
 
-def analyze_logs(events, failed_login_threshold=5):
-    """Run explainable rules against normalized log events."""
+def _parse_timestamp(value):
+    """Parse common ISO and syslog timestamps; return None when unavailable."""
+    value = _clean(value)
+    if not value:
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized).replace(tzinfo=None)
+    except ValueError:
+        pass
+    for fmt in ("%b %d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S"):
+        try:
+            parsed = datetime.strptime(value, fmt)
+            if "%Y" not in fmt:
+                parsed = parsed.replace(year=datetime.now().year)
+            return parsed
+        except ValueError:
+            continue
+    return None
+
+
+def analyze_logs(events, failed_login_threshold=5, time_window_minutes=5, sequence_threshold=3):
+    """Run explainable, time-aware rules against normalized log events.
+
+    Events without parseable timestamps are still considered for per-event rules,
+    but are excluded from time-window correlation to avoid misleading alerts.
+    """
     alerts = []
     failures_by_ip = defaultdict(list)
     successes_by_ip = defaultdict(list)
@@ -141,79 +176,82 @@ def analyze_logs(events, failed_login_threshold=5):
         status = (event.get("status") or "").lower()
         message = (event.get("message") or "").lower()
         event_type = (event.get("event_type") or "").lower()
+        event_id = _clean(event.get("event_id"))
+        timestamp = _parse_timestamp(event.get("timestamp"))
+
+        # Support event IDs embedded in message text as well as structured CSV fields.
+        if event_id == "4625" or re.search(r"\bevent\s*id\s*[:=]?\s*4625\b", message):
+            status, event_type = "failed", "login"
+        elif event_id == "4624" or re.search(r"\bevent\s*id\s*[:=]?\s*4624\b", message):
+            status, event_type = "success", "login"
 
         if ip and status in {"failed", "failure", "denied", "invalid"}:
-            failures_by_ip[ip].append((index, event))
+            failures_by_ip[ip].append((index, timestamp, event))
         if ip and status in {"success", "successful", "accepted", "ok"}:
-            successes_by_ip[ip].append((index, event))
+            successes_by_ip[ip].append((index, timestamp, event))
 
         if any(term in message for term in ["powershell -enc", "encodedcommand", "encoded command", "downloadstring", "invoke-expression", "invoke-webrequest"]):
-            alerts.append({
-                "id": f"PROC-{index+1}",
-                "severity": "High",
-                "title": "Potentially suspicious command execution",
-                "description": "The log message contains a command pattern commonly worth reviewing during endpoint investigations.",
-                "evidence": event.get("message", "")[:500],
-                "source_ip": ip,
-                "event_count": 1,
-                "rule": "Suspicious process/command keywords",
-            })
+            alerts.append({"id": f"PROC-{index+1}", "severity": "High", "title": "Potentially suspicious command execution", "description": "The log message contains a command pattern commonly worth reviewing during endpoint investigations.", "evidence": event.get("message", "")[:500], "source_ip": ip, "event_count": 1, "rule": "Suspicious process/command keywords"})
 
         if any(term in message for term in ["privilege escalation", "privilege elevated", "added to administrators", "added to sudoers", "sudo command", "administrator privileges granted", "new local admin"]):
-            alerts.append({
-                "id": f"PRIV-{index+1}",
-                "severity": "High",
-                "title": "Privileged activity detected",
-                "description": "A log message indicates privileged command or account activity. Confirm whether it was authorized.",
-                "evidence": event.get("message", "")[:500],
-                "source_ip": ip,
-                "event_count": 1,
-                "rule": "Privileged activity keywords",
-            })
+            alerts.append({"id": f"PRIV-{index+1}", "severity": "High", "title": "Privileged activity detected", "description": "A log message indicates privileged command or account activity. Confirm whether it was authorized.", "evidence": event.get("message", "")[:500], "source_ip": ip, "event_count": 1, "rule": "Privileged activity keywords"})
 
         if any(term in message for term in ["ransomware", "trojan detected", "malware detected", "quarantined threat", "defender detected"]):
-            alerts.append({
-                "id": f"MAL-{index+1}",
-                "severity": "Critical",
-                "title": "Malware-related log indicator",
-                "description": "The log contains a malware or quarantine-related indicator that should be validated in the source security product.",
-                "evidence": event.get("message", "")[:500],
-                "source_ip": ip,
-                "event_count": 1,
-                "rule": "Malware keyword detection",
-            })
+            alerts.append({"id": f"MAL-{index+1}", "severity": "Critical", "title": "Malware-related log indicator", "description": "The log contains a malware or quarantine-related indicator that should be validated in the source security product.", "evidence": event.get("message", "")[:500], "source_ip": ip, "event_count": 1, "rule": "Malware keyword detection"})
 
+    window_seconds = max(1, int(time_window_minutes)) * 60
     for ip, failures in failures_by_ip.items():
-        if len(failures) >= failed_login_threshold:
-            users = sorted({e.get("username") for _, e in failures if e.get("username")})
+        # Only timestamped events can be correlated into a reliable time window.
+        timed_failures = sorted([(ts, event) for _, ts, event in failures if ts is not None], key=lambda x: x[0])
+        peak_window = []
+        left = 0
+        for right, (right_ts, _) in enumerate(timed_failures):
+            while (right_ts - timed_failures[left][0]).total_seconds() > window_seconds:
+                left += 1
+            candidate = timed_failures[left:right + 1]
+            if len(candidate) > len(peak_window):
+                peak_window = candidate
+
+        count_for_rule = len(peak_window)
+        if count_for_rule >= failed_login_threshold:
+            users = sorted({e.get("username") for _, e in peak_window if e.get("username")})
             alerts.append({
                 "id": f"AUTH-{ip}",
-                "severity": "High" if len(failures) >= 10 else "Medium",
+                "severity": "High" if count_for_rule >= max(failed_login_threshold * 2, 10) else "Medium",
                 "title": "Repeated failed logins / possible brute-force activity",
-                "description": f"{len(failures)} failed authentication events were observed for the same source IP. Review whether this is expected behavior.",
-                "evidence": f"{len(failures)} failed login events; affected account(s): {', '.join(users) if users else 'not identified'}.",
+                "description": f"{count_for_rule} failed authentication events from the same source IP occurred within {time_window_minutes} minutes.",
+                "evidence": f"Peak window: {count_for_rule} failures; affected account(s): {', '.join(users) if users else 'not identified'}.",
                 "source_ip": ip,
-                "event_count": len(failures),
-                "rule": f"Failed login threshold ≥ {failed_login_threshold}",
+                "event_count": count_for_rule,
+                "rule": f"Failed logins ≥ {failed_login_threshold} within {time_window_minutes} minutes",
             })
 
-        success_indices = [i for i, _ in successes_by_ip.get(ip, [])]
-        failure_indices = [i for i, _ in failures]
-        if failure_indices and success_indices and min(success_indices) > min(failure_indices):
-            # Raise a separate alert when at least three failures precede a later success in log order.
-            first_success = min(success_indices)
-            failures_before_success = [(i, e) for i, e in failures if i < first_success]
-            if len(failures_before_success) >= 3:
-                alerts.append({
-                    "id": f"AUTH-SUCCESS-{ip}",
-                    "severity": "High",
-                    "title": "Successful login after repeated failures",
-                    "description": "A successful authentication event appears after multiple failures from the same source IP in the supplied log order. Validate the account and source.",
-                    "evidence": f"{len(failures_before_success)} failed login events preceded a successful login from {ip}.",
-                    "source_ip": ip,
-                    "event_count": len(failures_before_success) + 1,
-                    "rule": "Failed-then-success authentication sequence",
-                })
+        # Correlate failed attempts followed by success using timestamps where possible.
+        timed_successes = [(ts, event) for _, ts, event in successes_by_ip.get(ip, []) if ts is not None]
+        sequence_detected = False
+        if timed_failures and timed_successes:
+            for success_ts, _ in sorted(timed_successes, key=lambda x: x[0]):
+                preceding = [(ts, event) for ts, event in timed_failures if 0 <= (success_ts - ts).total_seconds() <= window_seconds]
+                if len(preceding) >= sequence_threshold:
+                    alerts.append({
+                        "id": f"AUTH-SUCCESS-{ip}-{len(alerts)+1}", "severity": "High",
+                        "title": "Successful login after repeated failures",
+                        "description": f"A successful authentication followed at least {sequence_threshold} failures from the same source IP within {time_window_minutes} minutes.",
+                        "evidence": f"{len(preceding)} timestamped failures preceded a successful login from {ip}.",
+                        "source_ip": ip, "event_count": len(preceding) + 1,
+                        "rule": "Failed-then-success authentication sequence",
+                    })
+                    sequence_detected = True
+                    break
+        # Conservative fallback for untimestamped logs: retain sequence analysis by input order.
+        if not sequence_detected and not timed_failures:
+            success_indices = [i for i, _, _ in successes_by_ip.get(ip, [])]
+            failure_indices = [i for i, _, _ in failures]
+            if success_indices:
+                first_success = min(success_indices)
+                preceding = [(i, e) for i, _, e in failures if i < first_success]
+                if len(preceding) >= sequence_threshold:
+                    alerts.append({"id": f"AUTH-SUCCESS-{ip}", "severity": "High", "title": "Successful login after repeated failures", "description": "A successful authentication appears after multiple failures in input order. Timestamps were unavailable, so verify event chronology.", "evidence": f"{len(preceding)} failures appeared before a successful login from {ip}.", "source_ip": ip, "event_count": len(preceding) + 1, "rule": "Failed-then-success sequence (input-order fallback)"})
 
     severity_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
     alerts.sort(key=lambda a: (severity_order.get(a["severity"], 4), -a.get("event_count", 1)))
